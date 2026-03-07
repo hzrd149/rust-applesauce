@@ -168,7 +168,7 @@ impl RelaySocket {
                             Some(Ok(Message::Close(_))) | None => break,
                             Some(Ok(_)) => {}
                             Some(Err(e)) => {
-                                eprintln!("[rx-rs-nostr/socket] ws error: {e}");
+                                eprintln!("[rust-applesauce/socket] ws error: {e}");
                                 break;
                             }
                         }
@@ -262,7 +262,7 @@ impl RelaySocket {
                 match rx.recv().await {
                     Ok(text) => yield text,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[rx-rs-nostr/socket] messages() lagged by {n}");
+                        eprintln!("[rust-applesauce/socket] messages() lagged by {n}");
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
@@ -299,7 +299,7 @@ impl RelaySocket {
     /// # Example
     ///
     /// ```no_run
-    /// # use rx_rs_nostr::RelaySocket;
+    /// # use rust_applesauce::RelaySocket;
     /// # use futures_util::StreamExt;
     /// # #[tokio::main] async fn main() {
     /// let socket = RelaySocket::new("wss://relay.damus.io");
@@ -359,7 +359,7 @@ impl RelaySocket {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[rx-rs-nostr/socket] multiplex lagged by {n}");
+                        eprintln!("[rust-applesauce/socket] multiplex lagged by {n}");
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }

@@ -332,10 +332,10 @@ impl Relay {
                 match rx_msg.recv().await {
                     Ok(text) => match RelayMessage::from_json(&text) {
                         Ok(msg) => yield msg,
-                        Err(e) => eprintln!("[rx-rs-nostr/relay] parse error: {e}"),
+                        Err(e) => eprintln!("[rust-applesauce/relay] parse error: {e}"),
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[rx-rs-nostr/relay] messages() lagged by {n}");
+                        eprintln!("[rust-applesauce/relay] messages() lagged by {n}");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
@@ -402,8 +402,8 @@ impl From<SocketError> for RelayError {
 /// Import this trait to chain the adapters directly onto the stream:
 ///
 /// ```no_run
-/// # use rx_rs_nostr::{Filter, Relay};
-/// # use rx_rs_nostr::ReqStreamExt;
+/// # use rust_applesauce::{Filter, Relay};
+/// # use rust_applesauce::ReqStreamExt;
 /// # use futures_util::StreamExt;
 /// # #[tokio::main] async fn main() {
 /// let relay = Relay::new("wss://relay.damus.io");

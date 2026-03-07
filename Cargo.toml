@@ -1,5 +1,5 @@
 [package]
-name = "rx-rs-nostr"
+name = "rust-applesauce"
 version = "0.1.0"
 edition = "2024"
 

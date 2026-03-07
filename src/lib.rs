@@ -1,4 +1,4 @@
-//! # rx-rs-nostr
+//! # rust-applesauce
 //!
 //! A stateless Nostr relay connection library built on top of async Rust
 //! streams and tokio-tungstenite.
@@ -6,7 +6,7 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use rx_rs_nostr::{Filter, Relay, ReqMessage};
+//! use rust_applesauce::{Filter, Relay, ReqMessage};
 //! use futures_util::StreamExt; // .next()
 //!
 //! #[tokio::main]

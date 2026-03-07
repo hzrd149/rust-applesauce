@@ -11,7 +11,7 @@
 //!   cargo run --example 03_multiple_filters
 
 use futures_util::StreamExt;
-use rx_rs_nostr::{Filter, Relay, ReqMessage};
+use rust_applesauce::{Filter, Relay, ReqMessage};
 
 #[tokio::main]
 async fn main() {

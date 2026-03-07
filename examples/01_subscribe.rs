@@ -6,7 +6,7 @@
 //!   cargo run --example 01_subscribe
 
 use futures_util::StreamExt;
-use rx_rs_nostr::{Filter, Relay, ReqMessage, ReqStreamExt};
+use rust_applesauce::{Filter, Relay, ReqMessage, ReqStreamExt};
 
 const RELAY: &str = "wss://relay.damus.io";
 
