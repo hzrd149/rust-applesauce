@@ -9,45 +9,19 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rxrust::prelude::*;
-use rxrust::observer::Observer as RxObserver;
+use async_stream::stream;
+use futures_util::{Stream, StreamExt};
 use tokio::sync::oneshot;
 
-use crate::socket::{MultiplexGuard, RelaySocket, SocketError};
+use crate::socket::{RelaySocket, SocketError};
 use crate::types::{
     ClientMessage, CountResponse, Filter, NostrEvent, PublishResponse, ReqMessage, RelayError,
     RelayMessage,
 };
 
-// Re-export the default keepAlive so callers don't need to import socket.
 pub use crate::socket::DEFAULT_KEEP_ALIVE;
 
-// ---------------------------------------------------------------------------
-// ReqHandle
-// ---------------------------------------------------------------------------
-
-/// A handle to an active Nostr subscription.
-///
-/// Wraps a [`MultiplexGuard`] (which owns the socket channel) and presents a
-/// typed `SharedSubject<ReqMessage, RelayError>`.
-///
-/// Dropping the handle sends `CLOSE` to the relay and starts the socket's
-/// keepAlive timer.
-pub struct ReqHandle {
-    /// The typed observable stream of relay messages for this subscription.
-    pub subject: SharedSubject<'static, ReqMessage, RelayError>,
-    /// Keeps the underlying multiplex channel alive. Drop = CLOSE + keepAlive.
-    _channel: MultiplexGuard,
-}
-
-impl std::ops::Deref for ReqHandle {
-    type Target = SharedSubject<'static, ReqMessage, RelayError>;
-    fn deref(&self) -> &Self::Target { &self.subject }
-}
-
-impl std::ops::DerefMut for ReqHandle {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.subject }
-}
+use std::pin::Pin;
 
 // ---------------------------------------------------------------------------
 // Relay
@@ -55,15 +29,19 @@ impl std::ops::DerefMut for ReqHandle {
 
 /// A Nostr relay client.
 ///
-/// # Lifecycle
+/// # Lazy connection
 ///
-/// The WebSocket is opened automatically on the first call to
-/// [`req`](Relay::req), [`publish`](Relay::publish), [`count`](Relay::count),
-/// or [`auth`](Relay::auth). No explicit `connect()` is required.
+/// The WebSocket opens automatically the first time a stream returned by
+/// [`req`](Relay::req) is polled, or when [`publish`](Relay::publish) /
+/// [`count`](Relay::count) / [`auth`](Relay::auth) are awaited. No explicit
+/// `connect()` call is needed.
 ///
-/// After the last active [`ReqHandle`] is dropped, a keepAlive timer starts.
-/// If no new subscription arrives before it expires the socket closes
-/// automatically.
+/// # Subscriptions and keepAlive
+///
+/// [`req`](Relay::req) returns a cold [`Stream`] synchronously. On first poll
+/// the REQ is sent and events start flowing. Dropping the stream sends `CLOSE`
+/// to the relay. After the last active stream is dropped a keepAlive timer
+/// starts; if no new stream is polled before it expires the socket closes.
 ///
 /// # Clone semantics
 ///
@@ -101,112 +79,86 @@ impl Relay {
 
     /// Subscribe to the relay with the given filters.
     ///
-    /// **Connects automatically** if not already connected. The connection is
-    /// shared with all concurrent subscriptions.
+    /// Returns a cold [`Stream`] synchronously — nothing happens until the
+    /// stream is first polled. On first poll:
     ///
-    /// Returns a [`ReqHandle`] whose `.subject` field emits [`ReqMessage`]
-    /// items. Dropping the handle sends `CLOSE` and starts the keepAlive.
-    pub async fn req(&self, filters: Vec<Filter>) -> Result<ReqHandle, RelayError> {
-        let sub_id = nanoid::nanoid!(12);
-        let url = self.socket.url().to_string();
+    /// 1. The WebSocket connects (if not already open).
+    /// 2. A `REQ` message is sent with a generated subscription ID.
+    /// 3. Items begin flowing.
+    ///
+    /// Stream items are `Result<ReqMessage, RelayError>`:
+    ///
+    /// - `Ok(Open { .. })`   — subscription registered; REQ was accepted.
+    /// - `Ok(Event { .. })`  — a matching event arrived.
+    /// - `Ok(Eose { .. })`   — end of stored events; live feed continues.
+    /// - `Ok(Closed { .. })` — relay closed the subscription; stream ends.
+    /// - `Err(_)`            — connection error; stream ends.
+    ///
+    /// Dropping the stream before it ends sends `CLOSE` to the relay and
+    /// starts the keepAlive timer.
+    pub fn req(
+        &self,
+        filters: Vec<Filter>,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ReqMessage, RelayError>> + Send + 'static>> {
+        // Clone everything the stream block needs to own.
+        let socket = self.socket.clone();
 
-        let subscribe_msg = ClientMessage::Req {
-            id: sub_id.clone(),
-            filters: filters.clone(),
-        }
-        .to_json();
-        let unsubscribe_msg = ClientMessage::Close { id: sub_id.clone() }.to_json();
+        Box::pin(stream! {
+            let sub_id = nanoid::nanoid!(12);
+            let url = socket.url().to_string();
 
-        // Open a multiplexed channel; frames that contain our sub_id are forwarded.
-        let sub_id_filter = sub_id.clone();
-        let channel = self
-            .socket
-            .multiplex(subscribe_msg, unsubscribe_msg, move |text| {
-                text.contains(&sub_id_filter)
-            })
-            .await
-            .map_err(RelayError::from)?;
+            let subscribe_msg = ClientMessage::Req {
+                id: sub_id.clone(),
+                filters: filters.clone(),
+            }.to_json();
+            let unsubscribe_msg = ClientMessage::Close { id: sub_id.clone() }.to_json();
 
-        // Build a typed SharedSubject on top of the raw String channel.
-        let mut typed: SharedSubject<'static, ReqMessage, RelayError> = Subject::shared();
-        let typed_for_task = typed.clone();
+            // Open a multiplexed channel filtered to our sub_id.
+            // `_sender` is unused here — relay.rs uses socket.send() for
+            // outbound. `_stream` holds the RAII guard; dropping it sends
+            // CLOSE and starts the keepAlive timer.
+            let sub_id_filter = sub_id.clone();
+            let (mut channel, _sender) = match socket
+                .multiplex(subscribe_msg, unsubscribe_msg, move |text| {
+                    text.contains(&sub_id_filter)
+                })
+                .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    yield Err(RelayError::from(e));
+                    return;
+                }
+            };
 
-        // Emit OPEN immediately.
-        RxObserver::next(typed.inner_mut(), ReqMessage::Open {
-            from: url.clone(),
-            id: sub_id.clone(),
-            filters: filters.clone(),
-        });
+            // Synthetic Open — immediately confirms the REQ was sent.
+            yield Ok(ReqMessage::Open {
+                from: url.clone(),
+                id: sub_id.clone(),
+                filters: filters.clone(),
+            });
 
-        // Use subscribe_raw() for the inbound bridge — rxRust's subscribe(closure)
-        // requires Observer<Item, Infallible> which conflicts with our () error type.
-        let mut raw_rx = self.socket.subscribe_raw().await.map_err(RelayError::from)?;
-
-        let sub_id_task = sub_id.clone();
-        let url_task = url.clone();
-
-        tokio::spawn(async move {
-            loop {
-                match raw_rx.recv().await {
-                    Ok(text) => {
-                        // Only handle messages for our subscription.
-                        if !text.contains(&sub_id_task) {
-                            continue;
-                        }
-                        match RelayMessage::from_json(&text) {
-                            Ok(RelayMessage::Event { sub_id: sid, event })
-                                if sid == sub_id_task =>
-                            {
-                                RxObserver::next(
-                                    typed_for_task.clone().inner_mut(),
-                                    ReqMessage::Event {
-                                        from: url_task.clone(),
-                                        id: sid,
-                                        event,
-                                    },
-                                );
-                            }
-                            Ok(RelayMessage::Eose { sub_id: sid }) if sid == sub_id_task => {
-                                RxObserver::next(
-                                    typed_for_task.clone().inner_mut(),
-                                    ReqMessage::Eose {
-                                        from: url_task.clone(),
-                                        id: sid,
-                                    },
-                                );
-                            }
-                            Ok(RelayMessage::Closed { sub_id: sid, reason })
-                                if sid == sub_id_task =>
-                            {
-                                RxObserver::next(
-                                    typed_for_task.clone().inner_mut(),
-                                    ReqMessage::Closed {
-                                        from: url_task.clone(),
-                                        id: sid,
-                                        reason,
-                                    },
-                                );
-                                RxObserver::complete(typed_for_task.clone().into_inner());
-                                break;
-                            }
-                            _ => {} // not ours or irrelevant
-                        }
+            // Drive the multiplexed stream — it's already filtered to our sub_id.
+            while let Some(text) = channel.next().await {
+                match RelayMessage::from_json(&text) {
+                    Ok(RelayMessage::Event { sub_id: sid, event }) if sid == sub_id => {
+                        yield Ok(ReqMessage::Event { from: url.clone(), id: sid, event });
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[rx-rs-nostr/relay] req() lagged by {n}");
+                    Ok(RelayMessage::Eose { sub_id: sid }) if sid == sub_id => {
+                        yield Ok(ReqMessage::Eose { from: url.clone(), id: sid });
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        RxObserver::error(
-                            typed_for_task.clone().into_inner(),
-                            RelayError::ConnectionClosed,
-                        );
-                        break;
+                    Ok(RelayMessage::Closed { sub_id: sid, reason }) if sid == sub_id => {
+                        yield Ok(ReqMessage::Closed { from: url.clone(), id: sid, reason });
+                        return; // relay closed — stream ends naturally
                     }
+                    _ => {} // other message types (AUTH, NOTICE, etc.) — ignore
                 }
             }
-        });
 
-        Ok(ReqHandle { subject: typed, _channel: channel })
+            // Channel closed (WS disconnected).
+            yield Err(RelayError::ConnectionClosed);
+            // channel drops here → DropGuard fires: CLOSE sent, keepAlive started
+        })
     }
 
     /// Publish a Nostr event to the relay.
@@ -372,35 +324,23 @@ impl Relay {
     /// **Connects automatically** if not already connected.
     pub async fn messages(
         &self,
-    ) -> Result<SharedSubject<'static, RelayMessage, ()>, RelayError> {
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = RelayMessage> + Send + 'static>>, RelayError> {
         let mut rx_msg = self.socket.subscribe_raw().await.map_err(RelayError::from)?;
 
-        let subject: SharedSubject<'static, RelayMessage, ()> = Subject::shared();
-        let subject_for_task = subject.clone();
-
-        tokio::spawn(async move {
+        Ok(Box::pin(stream! {
             loop {
                 match rx_msg.recv().await {
                     Ok(text) => match RelayMessage::from_json(&text) {
-                        Ok(msg) => {
-                            RxObserver::next(subject_for_task.clone().inner_mut(), msg);
-                        }
-                        Err(e) => {
-                            eprintln!("[rx-rs-nostr/relay] parse error: {e}");
-                        }
+                        Ok(msg) => yield msg,
+                        Err(e) => eprintln!("[rx-rs-nostr/relay] parse error: {e}"),
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[rx-rs-nostr/relay] messages() lagged by {n}");
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        RxObserver::error(subject_for_task.clone().into_inner(), ());
-                        break;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
-        });
-
-        Ok(subject)
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -415,6 +355,27 @@ impl Relay {
 
     /// Access the underlying [`RelaySocket`] directly.
     pub fn socket(&self) -> &RelaySocket { &self.socket }
+
+    // -----------------------------------------------------------------------
+    // Convenience stream adapters
+    // -----------------------------------------------------------------------
+
+    /// Subscribe and return only the [`NostrEvent`]s — skipping `Open`,
+    /// `Eose`, and `Closed` messages.
+    ///
+    /// This is shorthand for:
+    /// ```ignore
+    /// relay.req(filters).events()
+    /// ```
+    ///
+    /// Connection errors still propagate as `Err(RelayError)`.  If you also
+    /// need to react to `Eose` or `Closed`, use [`req`](Relay::req) directly.
+    pub fn events(
+        &self,
+        filters: Vec<Filter>,
+    ) -> Pin<Box<dyn Stream<Item = Result<NostrEvent, RelayError>> + Send + 'static>> {
+        self.req(filters).events()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,3 +390,71 @@ impl From<SocketError> for RelayError {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ReqStreamExt — chainable adapters for req() streams
+// ---------------------------------------------------------------------------
+
+/// Extension trait that adds Nostr-specific adapters to any
+/// `Stream<Item = Result<ReqMessage, RelayError>>` — i.e. the stream
+/// returned by [`Relay::req`].
+///
+/// Import this trait to chain the adapters directly onto the stream:
+///
+/// ```no_run
+/// # use rx_rs_nostr::{Filter, Relay};
+/// # use rx_rs_nostr::ReqStreamExt;
+/// # use futures_util::StreamExt;
+/// # #[tokio::main] async fn main() {
+/// let relay = Relay::new("wss://relay.damus.io");
+/// let filter = Filter { kinds: Some(vec![1]), limit: Some(5), ..Default::default() };
+///
+/// // Only events — Open / Eose / Closed are silently dropped.
+/// let mut stream = relay.req(vec![filter]).events();
+/// while let Some(result) = stream.next().await {
+///     let event = result.unwrap();
+///     println!("{}", event.content);
+/// }
+/// # }
+/// ```
+pub trait ReqStreamExt: Stream<Item = Result<ReqMessage, RelayError>> + Sized + Send + 'static {
+    /// Filter down to [`NostrEvent`]s only.
+    ///
+    /// `Open`, `Eose`, and `Closed` are silently discarded.
+    /// Connection errors are preserved as `Err(RelayError)`.
+    fn events(self) -> Pin<Box<dyn Stream<Item = Result<NostrEvent, RelayError>> + Send + 'static>> {
+        Box::pin(self.filter_map(|item| async move {
+            match item {
+                Ok(ReqMessage::Event { event, .. }) => Some(Ok(event)),
+                Ok(_) => None, // Open, Eose, Closed — discard
+                Err(e) => Some(Err(e)),
+            }
+        }))
+    }
+
+    /// Filter down to [`NostrEvent`]s, stopping when `Eose` arrives.
+    ///
+    /// Yields only stored (pre-EOSE) events.  The stream ends naturally after
+    /// `Eose` — useful for one-shot queries where you don't want the live feed.
+    /// Connection errors are preserved as `Err(RelayError)`.
+    fn until_eose(self) -> Pin<Box<dyn Stream<Item = Result<NostrEvent, RelayError>> + Send + 'static>> {
+        Box::pin(stream! {
+            let mut inner = Box::pin(self);
+            while let Some(item) = inner.next().await {
+                match item {
+                    Ok(ReqMessage::Event { event, .. }) => yield Ok(event),
+                    Ok(ReqMessage::Eose { .. }) => return, // stop cleanly
+                    Ok(_) => {}                            // Open, Closed — skip
+                    Err(e) => { yield Err(e); return; }
+                }
+            }
+        })
+    }
+}
+
+/// Blanket impl — automatically applies to the `Pin<Box<dyn Stream<...>>>`
+/// returned by [`Relay::req`].
+impl<S> ReqStreamExt for S
+where
+    S: Stream<Item = Result<ReqMessage, RelayError>> + Send + 'static,
+{}

@@ -2,30 +2,29 @@
 //!
 //! A low-level WebSocket abstraction modelled after RxJS's `WebSocketSubject`.
 //!
-//! `RelaySocket` owns the connection lifecycle — opening, closing, keepAlive —
-//! and exposes three building blocks:
+//! `RelaySocket` owns the connection lifecycle and exposes three building
+//! blocks:
 //!
 //! - [`RelaySocket::send`]      — write a raw text frame
-//! - [`RelaySocket::messages`]  — observe every inbound text frame
-//! - [`RelaySocket::multiplex`] — demultiplex one logical channel over the
-//!                                shared socket, with automatic subscribe /
-//!                                unsubscribe on create / drop
+//! - [`RelaySocket::messages`]  — observe every inbound text frame as a Stream
+//! - [`RelaySocket::multiplex`] — open a logical channel over the shared
+//!                                socket, returning an inbound [`Stream`] and
+//!                                an outbound [`SocketSender`]
 //!
-//! Higher-level code (e.g. the Nostr [`Relay`](crate::relay::Relay)) never
-//! touches WebSocket primitives directly.
+//! Higher-level code (e.g. [`Relay`](crate::relay::Relay)) never touches
+//! WebSocket primitives directly.
 
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures_util::SinkExt;
-use futures_util::StreamExt as WsStreamExt;
-use rxrust::prelude::*;
-use rxrust::observer::Observer as RxObserver;
+use async_stream::stream;
+use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-/// Default keepAlive duration — how long the socket stays open after the last
+/// Default keepAlive — how long the socket stays open after the last
 /// multiplexed channel is dropped.
 pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(30);
 
@@ -34,62 +33,68 @@ pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(30);
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-enum Command {
+pub(crate) enum Command {
     Send(String),
     Disconnect,
 }
 
 // ---------------------------------------------------------------------------
-// ConnectionHandle — live connection state
+// ConnectionHandle — live connection state (crate-private)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) struct ConnectionHandle {
-    cmd_tx: mpsc::UnboundedSender<Command>,
+    pub(crate) cmd_tx: mpsc::UnboundedSender<Command>,
     /// Broadcast fan-out of every inbound text frame.
-    msg_tx: broadcast::Sender<String>,
+    pub(crate) msg_tx: broadcast::Sender<String>,
 }
 
 // ---------------------------------------------------------------------------
-// MultiplexGuard — RAII unsubscribe for a single channel
+// SocketSender — outbound half of a multiplexed channel
 // ---------------------------------------------------------------------------
 
-/// Returned by [`RelaySocket::multiplex`]. Dropping this sends the
-/// unsubscribe message and decrements the socket's reference count, which
-/// may trigger the keepAlive timer.
-pub struct MultiplexGuard {
-    /// The inbound message stream for this channel.
-    pub subject: SharedSubject<'static, String, ()>,
-    _inner: Arc<MultiplexGuardInner>,
-}
-
-struct MultiplexGuardInner {
-    unsubscribe_msg: String,
+/// The outbound half returned by [`RelaySocket::multiplex`].
+///
+/// Call [`send`](SocketSender::send) to write raw text frames to the relay
+/// over the shared WebSocket connection.
+///
+/// Cheap to clone — all clones write to the same socket.
+#[derive(Clone)]
+pub struct SocketSender {
     cmd_tx: mpsc::UnboundedSender<Command>,
+}
+
+impl SocketSender {
+    /// Send a raw text frame to the relay.
+    pub fn send(&self, text: String) -> Result<(), SocketError> {
+        self.cmd_tx
+            .send(Command::Send(text))
+            .map_err(|_| SocketError::Closed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DropGuard — RAII teardown for a multiplexed channel
+// ---------------------------------------------------------------------------
+
+/// Sends the unsubscribe message and decrements the ref-count when dropped.
+/// Captured inside the `stream!` block so it fires on any drop path —
+/// whether the stream is fully consumed or abandoned early.
+struct DropGuard {
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    unsubscribe_msg: String,
     sub_count: Arc<AtomicUsize>,
     socket: RelaySocket,
 }
 
-impl Drop for MultiplexGuardInner {
+impl Drop for DropGuard {
     fn drop(&mut self) {
-        // Send the unsubscribe message (e.g. `["CLOSE","<id>"]`).
         let _ = self.cmd_tx.send(Command::Send(self.unsubscribe_msg.clone()));
-
-        // Decrement ref-count; start keepAlive if this was the last channel.
         let prev = self.sub_count.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
             self.socket.schedule_keep_alive();
         }
     }
-}
-
-impl std::ops::Deref for MultiplexGuard {
-    type Target = SharedSubject<'static, String, ()>;
-    fn deref(&self) -> &Self::Target { &self.subject }
-}
-
-impl std::ops::DerefMut for MultiplexGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.subject }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,20 +103,10 @@ impl std::ops::DerefMut for MultiplexGuard {
 
 /// A lazy, reference-counted WebSocket connection.
 ///
-/// Modelled after RxJS's `WebSocketSubject`:
-///
-/// - The socket opens on the first [`multiplex`](RelaySocket::multiplex) /
-///   [`send`](RelaySocket::send) call; no explicit `connect()` needed.
+/// - Opens on first use — no explicit `connect()` needed.
 /// - All [`multiplex`](RelaySocket::multiplex) channels share one socket.
-/// - After the last channel is dropped, a keepAlive timer starts; if no new
-///   channel is opened before it expires, the socket closes.
-/// - [`connect`](RelaySocket::connect) / [`disconnect`](RelaySocket::disconnect)
-///   are available for explicit lifecycle control.
-///
-/// # Clone semantics
-///
-/// `RelaySocket` is cheaply `Clone`able — all clones share the same underlying
-/// connection, ref-count, and keepAlive state.
+/// - After the last channel drops, a keepAlive timer starts; if no new
+///   channel opens before it expires, the socket closes.
 #[derive(Clone)]
 pub struct RelaySocket {
     url: String,
@@ -142,7 +137,6 @@ impl RelaySocket {
     // -----------------------------------------------------------------------
 
     /// Ensure the WebSocket is open, connecting if necessary.
-    ///
     /// Safe to call concurrently — only one connection is ever opened.
     pub(crate) async fn ensure_connected(&self) -> Result<ConnectionHandle, SocketError> {
         // Fast path.
@@ -222,9 +216,8 @@ impl RelaySocket {
         self.sub_count.store(0, Ordering::SeqCst);
     }
 
-    /// Schedule a keepAlive check after `self.keep_alive`. If no channels are
-    /// active when the timer fires, the socket is closed.
-    fn schedule_keep_alive(&self) {
+    /// Schedule a keepAlive check. Called when a channel's ref-count hits 0.
+    pub(crate) fn schedule_keep_alive(&self) {
         let handle_arc = Arc::clone(&self.handle);
         let sub_count = Arc::clone(&self.sub_count);
         let keep_alive = self.keep_alive;
@@ -245,7 +238,7 @@ impl RelaySocket {
     // Public I/O surface
     // -----------------------------------------------------------------------
 
-    /// Send a raw text frame to the remote end.
+    /// Send a raw text frame to the relay.
     ///
     /// Connects automatically if not already connected.
     pub async fn send(&self, text: String) -> Result<(), SocketError> {
@@ -256,121 +249,126 @@ impl RelaySocket {
             .map_err(|_| SocketError::Closed)
     }
 
-    /// Send a raw text frame using an already-obtained handle.
-    ///
-    /// This is the sync variant used internally when a handle is already in
-    /// hand (avoids double-locking in hot paths).
-    pub(crate) fn send_with_handle(
-        handle: &ConnectionHandle,
-        text: String,
-    ) -> Result<(), SocketError> {
-        handle
-            .cmd_tx
-            .send(Command::Send(text))
-            .map_err(|_| SocketError::Closed)
-    }
-
-    /// Subscribe to every inbound text frame as an rxRust `SharedSubject`.
+    /// Subscribe to every inbound text frame as a `Stream<Item = String>`.
     ///
     /// Connects automatically if not already connected.
-    pub async fn messages(&self) -> Result<SharedSubject<'static, String, ()>, SocketError> {
-        let handle = self.ensure_connected().await?;
-        let subject: SharedSubject<'static, String, ()> = Subject::shared();
-        let subject_for_task = subject.clone();
-        let mut rx = handle.msg_tx.subscribe();
+    pub async fn messages(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send + 'static>>, SocketError> {
+        let mut rx = self.ensure_connected().await?.msg_tx.subscribe();
 
-        tokio::spawn(async move {
+        Ok(Box::pin(stream! {
             loop {
                 match rx.recv().await {
-                    Ok(text) => {
-                        RxObserver::next(subject_for_task.clone().inner_mut(), text);
-                    }
+                    Ok(text) => yield text,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[rx-rs-nostr/socket] messages() lagged by {n}");
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        RxObserver::error(subject_for_task.clone().into_inner(), ());
-                        break;
-                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-        });
-
-        Ok(subject)
+        }))
     }
 
     /// Subscribe to every inbound text frame as a raw `broadcast::Receiver`.
     ///
-    /// This is the low-overhead variant used internally by [`Relay`] to avoid
-    /// the overhead of an extra rxRust layer for one-shot operations.
-    pub async fn subscribe_raw(&self) -> Result<broadcast::Receiver<String>, SocketError> {
-        let handle = self.ensure_connected().await?;
-        Ok(handle.msg_tx.subscribe())
+    /// Used internally by `Relay` for one-shot request/response operations
+    /// (publish, count, auth) where a lightweight receiver is enough.
+    pub(crate) async fn subscribe_raw(
+        &self,
+    ) -> Result<broadcast::Receiver<String>, SocketError> {
+        Ok(self.ensure_connected().await?.msg_tx.subscribe())
     }
 
     /// Open a multiplexed logical channel over the shared socket.
     ///
     /// Analogous to RxJS `WebSocketSubject.multiplex()`:
     ///
-    /// - `subscribe_msg`   is sent to the remote end immediately.
-    /// - `unsubscribe_msg` is sent when the returned [`MultiplexGuard`] is
-    ///                     dropped.
-    /// - `filter`          is called with each inbound frame; only frames for
-    ///                     which it returns `true` are forwarded to the
-    ///                     guard's subject.
+    /// - `subscribe_msg`   is sent immediately when the channel opens.
+    /// - `unsubscribe_msg` is sent when the returned stream is dropped.
+    /// - `filter`          selects which inbound frames belong to this channel.
     ///
-    /// The returned [`MultiplexGuard`] holds an rxRust `SharedSubject<String, ()>`
-    /// (accessible via `.subject` or `Deref`). Dropping the guard sends the
-    /// unsubscribe message and starts the keepAlive timer if this was the last
-    /// active channel.
+    /// Returns a `(stream, sender)` pair:
+    ///
+    /// - **`stream`** — `Pin<Box<dyn Stream<Item = String>>>` yielding every
+    ///   inbound frame that passes `filter`. Dropping the stream sends the
+    ///   unsubscribe message and starts the keepAlive timer.
+    /// - **`sender`** — [`SocketSender`] for writing frames to the relay over
+    ///   this channel's shared connection.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rx_rs_nostr::RelaySocket;
+    /// # use futures_util::StreamExt;
+    /// # #[tokio::main] async fn main() {
+    /// let socket = RelaySocket::new("wss://relay.damus.io");
+    ///
+    /// let (mut stream, sender) = socket
+    ///     .multiplex(
+    ///         r#"["REQ","sub1",{"kinds":[1],"limit":5}]"#.into(),
+    ///         r#"["CLOSE","sub1"]"#.into(),
+    ///         |text| text.contains("sub1"),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// while let Some(frame) = stream.next().await {
+    ///     println!("{frame}");
+    /// }
+    /// # }
+    /// ```
     pub async fn multiplex(
         &self,
         subscribe_msg: String,
         unsubscribe_msg: String,
         filter: impl Fn(&str) -> bool + Send + Sync + 'static,
-    ) -> Result<MultiplexGuard, SocketError> {
+    ) -> Result<(Pin<Box<dyn Stream<Item = String> + Send + 'static>>, SocketSender), SocketError>
+    {
         let handle = self.ensure_connected().await?;
 
         // Increment ref-count before sending the subscribe message.
         self.sub_count.fetch_add(1, Ordering::SeqCst);
 
-        if let Err(e) = Self::send_with_handle(&handle, subscribe_msg) {
+        if handle.cmd_tx.send(Command::Send(subscribe_msg)).is_err() {
             self.sub_count.fetch_sub(1, Ordering::SeqCst);
-            return Err(e);
+            return Err(SocketError::Closed);
         }
 
-        let subject: SharedSubject<'static, String, ()> = Subject::shared();
-        let subject_for_task = subject.clone();
         let mut rx = handle.msg_tx.subscribe();
         let filter = Arc::new(filter);
 
-        tokio::spawn(async move {
+        // RAII guard — fires teardown (CLOSE + keepAlive) when dropped,
+        // regardless of whether the stream was fully consumed or dropped early.
+        let guard = DropGuard {
+            cmd_tx: handle.cmd_tx.clone(),
+            unsubscribe_msg,
+            sub_count: Arc::clone(&self.sub_count),
+            socket: self.clone(),
+        };
+
+        let inbound = Box::pin(stream! {
+            // Hold the guard alive for the lifetime of the stream.
+            let _guard = guard;
+
             loop {
                 match rx.recv().await {
                     Ok(text) => {
                         if filter(&text) {
-                            RxObserver::next(subject_for_task.clone().inner_mut(), text);
+                            yield text;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[rx-rs-nostr/socket] multiplex lagged by {n}");
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        RxObserver::error(subject_for_task.clone().into_inner(), ());
-                        break;
-                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
 
-        let guard = Arc::new(MultiplexGuardInner {
-            unsubscribe_msg,
-            cmd_tx: handle.cmd_tx.clone(),
-            sub_count: Arc::clone(&self.sub_count),
-            socket: self.clone(),
-        });
+        let sender = SocketSender { cmd_tx: handle.cmd_tx.clone() };
 
-        Ok(MultiplexGuard { subject, _inner: guard })
+        Ok((inbound, sender))
     }
 
     // -----------------------------------------------------------------------

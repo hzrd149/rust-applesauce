@@ -1,38 +1,33 @@
 //! # rx-rs-nostr
 //!
-//! A stateless Nostr relay connection library built on top of rxRust and
-//! tokio-tungstenite.
+//! A stateless Nostr relay connection library built on top of async Rust
+//! streams and tokio-tungstenite.
 //!
 //! ## Quick start
 //!
 //! ```no_run
-//! use rx_rs_nostr::{Relay, Filter};
-//! use rxrust::prelude::*;
+//! use rx_rs_nostr::{Filter, Relay, ReqMessage};
+//! use futures_util::StreamExt; // .next()
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // No explicit connect() needed — req() connects automatically.
 //!     let relay = Relay::new("wss://relay.damus.io");
 //!
-//!     let filter = Filter {
-//!         kinds: Some(vec![1]),
-//!         limit: Some(10),
-//!         ..Default::default()
-//!     };
+//!     let filter = Filter { kinds: Some(vec![1]), limit: Some(5), ..Default::default() };
 //!
-    //!     // req() is async and connects the WebSocket if not already open.
-    //!     // It returns a ReqHandle. Deref it to access the SharedSubject.
-    //!     let handle = relay.req(vec![filter]).await.unwrap();
-    //!
-    //!     // Chain .on_error() and .on_complete() for full lifecycle handling.
-    //!     let _sub = handle.subject
-    //!         .clone()
-    //!         .on_error(|e| eprintln!("error: {e:?}"))
-    //!         .on_complete(|| println!("done"))
-    //!         .subscribe(|msg| println!("{msg:?}"));
-    //!
-    //!     // When handle is dropped, a 30-second keepAlive timer starts.
-    //!     // If no new subscriptions arrive in that window, the socket closes.
+//!     // req() is synchronous — nothing happens until the stream is polled.
+//!     let mut stream = relay.req(vec![filter]);
+//!
+//!     // First poll connects the socket, sends REQ, and starts emitting.
+//!     while let Some(result) = stream.next().await {
+//!         match result {
+//!             Ok(ReqMessage::Event { event, .. }) => println!("{}", event.content),
+//!             Ok(ReqMessage::Eose { .. })         => break, // stored events done
+//!             Ok(_)                               => {}
+//!             Err(e)                              => { eprintln!("{e}"); break; }
+//!         }
+//!     }
+//!     // Dropping stream sends CLOSE; keepAlive timer starts.
 //! }
 //! ```
 
@@ -40,7 +35,7 @@ pub mod relay;
 pub mod socket;
 pub mod types;
 
-pub use relay::{Relay, ReqHandle, DEFAULT_KEEP_ALIVE};
+pub use relay::{Relay, ReqStreamExt, DEFAULT_KEEP_ALIVE};
 pub use socket::RelaySocket;
 pub use types::{
     ClientMessage, CountResponse, Filter, NostrEvent, PublishResponse, ReqMessage, RelayError,
@@ -50,6 +45,7 @@ pub use types::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::time::Duration;
 
     /// Smoke test: Relay starts disconnected with zero subscriptions.
@@ -93,7 +89,6 @@ mod tests {
             }],
         };
         let json = msg.to_json();
-        // Should start with ["REQ","test123",{...}]
         assert!(json.starts_with(r#"["REQ","test123","#));
     }
 
@@ -144,56 +139,71 @@ mod tests {
         }
     }
 
-    /// Verify that req() on a bad URL returns an error (no panic, no hang).
-    /// This also validates the lazy-connect path without needing a real relay.
+    /// req() is now sync — calling it does NOT connect the socket.
+    #[test]
+    fn req_is_sync_and_does_not_connect() {
+        let relay = Relay::new("wss://relay.damus.io");
+        let _stream = relay.req(vec![Filter::default()]);
+        // Socket must still be closed — nothing was polled.
+        assert!(!relay.is_connected());
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Polling req() on a bad URL surfaces the error as the first stream item.
     #[tokio::test]
-    async fn req_lazy_connect_fails_on_bad_url() {
+    async fn req_deferred_connect_fails_on_bad_url() {
         let relay = Relay::new("ws://127.0.0.1:1"); // port 1 — always refused
-        let result = relay.req(vec![Filter::default()]).await;
-        assert!(result.is_err(), "expected connection error, got Ok");
+        let mut stream = relay.req(vec![Filter::default()]);
+        // First poll triggers the connect attempt.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Err(_))),
+            "expected first item to be Err, got {first:?}"
+        );
         // Sub count must not have been incremented on connect failure.
         assert_eq!(relay.subscription_count(), 0);
     }
 
-    /// Verify keepAlive fires and disconnects after the last sub drops.
+    /// Dropping the stream sends CLOSE and decrements the sub count synchronously.
+    /// After keepAlive the socket closes.
     #[tokio::test]
     async fn keep_alive_disconnects_after_last_sub() {
         use tokio::net::TcpListener;
 
-        // Spin up a minimal echo TCP server that accepts but does nothing —
-        // just enough for the WS handshake to complete.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Accept connections and perform a bare WebSocket handshake.
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     let _ = tokio_tungstenite::accept_async(stream).await;
-                    // Just let the connection sit open.
                 });
             }
         });
 
-        // Use a very short keepAlive so the test completes quickly.
         let relay = Relay::with_keep_alive(
             format!("ws://{addr}"),
             Duration::from_millis(100),
         );
 
-        // req() should connect automatically.
-        let handle = relay.req(vec![Filter::default()]).await.unwrap();
-        assert!(relay.is_connected(), "should be connected after req()");
+        let mut stream = relay.req(vec![Filter::default()]);
+
+        // First poll connects and emits Open — the socket is now live.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Ok(ReqMessage::Open { .. }))),
+            "expected Open, got {first:?}"
+        );
+        assert!(relay.is_connected());
         assert_eq!(relay.subscription_count(), 1);
 
-        // Drop the ReqHandle — RAII guard sends CLOSE and decrements sub_count.
-        drop(handle);
+        // Drop the stream — RAII guard fires: CLOSE sent, sub_count → 0.
+        drop(stream);
 
-        // sub_count drops synchronously on drop() — no need to yield.
-        assert_eq!(relay.subscription_count(), 0, "sub count should be 0 after drop");
+        assert_eq!(relay.subscription_count(), 0);
 
-        // Wait for keepAlive to fire and close the connection.
+        // Wait for keepAlive to close the socket.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!relay.is_connected(), "connection should be closed after keepAlive");
+        assert!(!relay.is_connected());
     }
 }

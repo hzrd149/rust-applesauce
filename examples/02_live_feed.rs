@@ -9,9 +9,8 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use rx_rs_nostr::{Filter, Relay, ReqMessage};
-use rxrust::prelude::*;
-use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
@@ -25,103 +24,76 @@ async fn main() {
 
     let filter = Filter {
         kinds: Some(vec![1]),
-        since: Some(now - 3600), // last hour of stored events
+        since: Some(now - 3600),
         ..Default::default()
     };
 
-    let handle = relay
-        .req(vec![filter])
-        .await
-        .expect("failed to open subscription");
+    // req() returns immediately — the socket opens on first .next().
+    let mut stream = relay.req(vec![filter]);
 
     println!(
         "Streaming kind-1 notes from {} for 30 seconds...\n",
         relay.url()
     );
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<ReqMessage>();
-
-    let _sub = handle
-        .subject
-        .clone()
-        .on_error(|e| eprintln!("[error] {e:?}"))
-        .on_complete(|| println!("[stream complete]"))
-        .subscribe(move |msg| {
-            let _ = tx.send(msg);
-        });
-
-    // Phase tracking — are we in stored or live delivery?
     let mut live = false;
     let mut stored_count = 0usize;
     let mut live_count = 0usize;
 
-    // Drive the loop for at most 30 seconds.
     let deadline = tokio::time::sleep(Duration::from_secs(30));
     tokio::pin!(deadline);
 
     loop {
         tokio::select! {
-            // Timeout branch — clean up and exit.
             _ = &mut deadline => {
                 println!(
                     "\n[timeout] 30s elapsed.\
-                     \n  stored events received : {stored_count}\
-                     \n  live events received   : {live_count}"
+                     \n  stored events: {stored_count}\
+                     \n  live events  : {live_count}"
                 );
                 break;
             }
-
-            // Message branch.
-            msg = rx.recv() => {
-                let Some(msg) = msg else { break };
-
-                match msg {
-                    ReqMessage::Open { id, .. } => {
-                        println!("[open]   sub id = {id}");
-                    }
-                    ReqMessage::Event { event, .. } => {
-                        let preview = truncate(&event.content, 72);
-                        if live {
-                            live_count += 1;
+            item = stream.next() => {
+                match item {
+                    None => break,
+                    Some(Err(e)) => { eprintln!("[error] {e}"); break; }
+                    Some(Ok(msg)) => match msg {
+                        ReqMessage::Open { id, .. } => {
+                            println!("[open]   sub id = {id}");
+                        }
+                        ReqMessage::Event { event, .. } => {
+                            let preview = truncate(&event.content, 72);
+                            if live {
+                                live_count += 1;
+                                println!("[live ]  {} | {}", &event.id[..8], preview);
+                            } else {
+                                stored_count += 1;
+                                println!("[stored] {} | {}", &event.id[..8], preview);
+                            }
+                        }
+                        ReqMessage::Eose { .. } => {
+                            live = true;
                             println!(
-                                "[live ]  {} | {}",
-                                &event.id[..8], preview
-                            );
-                        } else {
-                            stored_count += 1;
-                            println!(
-                                "[stored] {} | {}",
-                                &event.id[..8], preview
+                                "\n[eose]   {stored_count} stored events — now streaming live...\n"
                             );
                         }
-                    }
-                    ReqMessage::Eose { .. } => {
-                        live = true;
-                        println!(
-                            "\n[eose]   {stored_count} stored events received — \
-                             now streaming live...\n"
-                        );
-                    }
-                    ReqMessage::Closed { reason, .. } => {
-                        println!("[closed] {reason}");
-                        break;
+                        ReqMessage::Closed { reason, .. } => {
+                            println!("[closed] {reason}");
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
-    drop(handle);
+    drop(stream);
     relay.disconnect();
     println!("Done.");
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
     let mut chars = s.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
+    let out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() { format!("{out}…") } else { out }
 }

@@ -1,96 +1,97 @@
-//! # Example 01 — Basic subscription
+//! # Example 01 — Subscribing to events
 //!
-//! The simplest possible usage: connect to relay.damus.io, subscribe to the
-//! 10 most recent kind-1 notes (short text posts), print each one, then exit.
+//! Three progressively simpler ways to get a stream of Nostr events.
 //!
 //! Run with:
 //!   cargo run --example 01_subscribe
 
-use rx_rs_nostr::{Filter, Relay, ReqMessage};
-use rxrust::prelude::*;
-use tokio::sync::mpsc;
+use futures_util::StreamExt;
+use rx_rs_nostr::{Filter, Relay, ReqMessage, ReqStreamExt};
+
+const RELAY: &str = "wss://relay.damus.io";
+
+fn filter() -> Filter {
+    Filter { kinds: Some(vec![1]), limit: Some(5), ..Default::default() }
+}
+
+// ---------------------------------------------------------------------------
+// Style 1 — raw req(), full control
+//
+// You get every message type and handle all cases. Use this when you need
+// to react to Eose, Closed, or errors differently.
+// ---------------------------------------------------------------------------
+async fn style_raw(relay: &Relay) {
+    println!("\n--- Style 1: raw req() ---");
+
+    let mut stream = relay.req(vec![filter()]);
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(ReqMessage::Open { id, .. }) => println!("  [open] {id}"),
+            Ok(ReqMessage::Event { event, .. }) => println!("  [event] {}", &event.id[..8]),
+            Ok(ReqMessage::Eose { .. }) => { println!("  [eose]"); break; }
+            Ok(ReqMessage::Closed { reason, .. }) => { println!("  [closed] {reason}"); break; }
+            Err(e) => { eprintln!("  [error] {e}"); break; }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Style 2 — .until_eose() adapter
+//
+// Yields only the stored events (before EOSE), then the stream ends.
+// Items are Result<NostrEvent, RelayError> — no more match arms for Open /
+// Eose / Closed.
+// ---------------------------------------------------------------------------
+async fn style_until_eose(relay: &Relay) {
+    println!("\n--- Style 2: .until_eose() ---");
+
+    let mut stream = relay.req(vec![filter()]).until_eose();
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => println!("  [event] {}", &event.id[..8]),
+            Err(e) => { eprintln!("  [error] {e}"); break; }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Style 3 — relay.events() shorthand
+//
+// The simplest form. Returns only NostrEvents from the live feed.
+// Equivalent to req(...).events() — discards Open / Eose / Closed silently.
+// Use this when you just want the events and nothing else.
+// ---------------------------------------------------------------------------
+async fn style_events(relay: &Relay) {
+    println!("\n--- Style 3: relay.events() ---");
+
+    // Take the first 5 events then stop — using standard StreamExt::take().
+    let mut stream = relay.events(vec![filter()]).take(5);
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => println!("  [event] {} | {}", &event.id[..8], truncate(&event.content, 60)),
+            Err(e) => { eprintln!("  [error] {e}"); break; }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    // ------------------------------------------------------------------
-    // 1. Create the relay handle.
-    //    No connection is made yet — it happens on the first req().
-    // ------------------------------------------------------------------
-    let relay = Relay::new("wss://relay.damus.io");
+    let relay = Relay::new(RELAY);
+    println!("Connecting to {RELAY}");
 
-    // ------------------------------------------------------------------
-    // 2. Build a filter: the 10 most recent kind-1 (text note) events.
-    // ------------------------------------------------------------------
-    let filter = Filter {
-        kinds: Some(vec![1]),
-        limit: Some(10),
-        ..Default::default()
-    };
+    style_raw(&relay).await;
+    style_until_eose(&relay).await;
+    style_events(&relay).await;
 
-    // ------------------------------------------------------------------
-    // 3. Open the subscription.
-    //    req() connects the WebSocket automatically and sends the REQ.
-    // ------------------------------------------------------------------
-    let handle = relay
-        .req(vec![filter])
-        .await
-        .expect("failed to open subscription");
-
-    println!("Connected to {}  (sub id printed below)", relay.url());
-
-    // ------------------------------------------------------------------
-    // 4. Subscribe to the stream.
-    //
-    //    We bridge into a Tokio channel so we can drive the loop from the
-    //    main async context (rxRust subscribers run synchronously on the
-    //    tokio task that pushes the value).
-    // ------------------------------------------------------------------
-    let (tx, mut rx) = mpsc::unbounded_channel::<ReqMessage>();
-
-    let _sub = handle
-        .subject
-        .clone()
-        .on_error(|e| eprintln!("[error] {e:?}"))
-        .on_complete(|| println!("[stream complete]"))
-        .subscribe(move |msg| {
-            let _ = tx.send(msg);
-        });
-
-    // ------------------------------------------------------------------
-    // 5. Process messages until EOSE, then stop.
-    //    After EOSE the relay switches to live delivery — we exit here
-    //    to keep the example short.  See 02_live_feed.rs for staying on.
-    // ------------------------------------------------------------------
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            ReqMessage::Open { id, .. } => {
-                println!("[open]   subscription id = {id}");
-            }
-            ReqMessage::Event { event, .. } => {
-                let preview = event.content.chars().take(80).collect::<String>();
-                let preview = if event.content.len() > 80 {
-                    format!("{preview}…")
-                } else {
-                    preview
-                };
-                println!("[event]  {} | kind={} | {}", &event.id[..8], event.kind, preview);
-            }
-            ReqMessage::Eose { .. } => {
-                println!("[eose]   end of stored events — exiting");
-                break;
-            }
-            ReqMessage::Closed { reason, .. } => {
-                println!("[closed] relay closed subscription: {reason}");
-                break;
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // 6. Drop the handle → sends CLOSE to the relay, starts keepAlive.
-    //    We disconnect explicitly here since we're done.
-    // ------------------------------------------------------------------
-    drop(handle);
     relay.disconnect();
-    println!("Done.");
+    println!("\nDone.");
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() { format!("{out}…") } else { out }
 }
