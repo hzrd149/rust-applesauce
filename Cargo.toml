@@ -1,0 +1,41 @@
+[package]
+name = "rx-rs-nostr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Reactive extensions
+rxrust = { version = "1.0.0-rc.3", features = ["scheduler"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+thiserror = "2"
+nanoid = "0.4"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[example]]
+name = "01_subscribe"
+path = "examples/01_subscribe.rs"
+
+[[example]]
+name = "02_live_feed"
+path = "examples/02_live_feed.rs"
+
+[[example]]
+name = "03_multiple_filters"
+path = "examples/03_multiple_filters.rs"
+
+[[example]]
+name = "04_concurrent_subs"
+path = "examples/04_concurrent_subs.rs"
