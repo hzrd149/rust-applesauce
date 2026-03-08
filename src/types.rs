@@ -60,16 +60,7 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn to_json(&self) -> String {
         match self {
-            ClientMessage::Req { id, filters } => {
-                let mut parts: Vec<serde_json::Value> = vec![
-                    serde_json::Value::String("REQ".into()),
-                    serde_json::Value::String(id.clone()),
-                ];
-                for f in filters {
-                    parts.push(serde_json::to_value(f).unwrap());
-                }
-                serde_json::to_string(&parts).unwrap()
-            }
+            ClientMessage::Req { id, filters } => serialize_id_filters("REQ", id, filters),
             ClientMessage::Close { id } => serde_json::to_string(&["CLOSE", id]).unwrap(),
             ClientMessage::Event(ev) => {
                 serde_json::to_string(&("EVENT", serde_json::to_value(ev).unwrap())).unwrap()
@@ -77,18 +68,20 @@ impl ClientMessage {
             ClientMessage::Auth(ev) => {
                 serde_json::to_string(&("AUTH", serde_json::to_value(ev).unwrap())).unwrap()
             }
-            ClientMessage::Count { id, filters } => {
-                let mut parts: Vec<serde_json::Value> = vec![
-                    serde_json::Value::String("COUNT".into()),
-                    serde_json::Value::String(id.clone()),
-                ];
-                for f in filters {
-                    parts.push(serde_json::to_value(f).unwrap());
-                }
-                serde_json::to_string(&parts).unwrap()
-            }
+            ClientMessage::Count { id, filters } => serialize_id_filters("COUNT", id, filters),
         }
     }
+}
+
+fn serialize_id_filters(verb: &str, id: &str, filters: &[Filter]) -> String {
+    let mut parts: Vec<serde_json::Value> = vec![
+        serde_json::Value::String(verb.into()),
+        serde_json::Value::String(id.into()),
+    ];
+    for f in filters {
+        parts.push(serde_json::to_value(f).unwrap());
+    }
+    serde_json::to_string(&parts).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +291,8 @@ pub enum RelayError {
     AuthRequired,
     #[error("URL parse error: {0}")]
     Url(String),
+    #[error("Operation timed out")]
+    Timeout,
 }
 
 #[cfg(test)]
