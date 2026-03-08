@@ -60,16 +60,7 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn to_json(&self) -> String {
         match self {
-            ClientMessage::Req { id, filters } => {
-                let mut parts: Vec<serde_json::Value> = vec![
-                    serde_json::Value::String("REQ".into()),
-                    serde_json::Value::String(id.clone()),
-                ];
-                for f in filters {
-                    parts.push(serde_json::to_value(f).unwrap());
-                }
-                serde_json::to_string(&parts).unwrap()
-            }
+            ClientMessage::Req { id, filters } => serialize_id_filters("REQ", id, filters),
             ClientMessage::Close { id } => serde_json::to_string(&["CLOSE", id]).unwrap(),
             ClientMessage::Event(ev) => {
                 serde_json::to_string(&("EVENT", serde_json::to_value(ev).unwrap())).unwrap()
@@ -77,18 +68,20 @@ impl ClientMessage {
             ClientMessage::Auth(ev) => {
                 serde_json::to_string(&("AUTH", serde_json::to_value(ev).unwrap())).unwrap()
             }
-            ClientMessage::Count { id, filters } => {
-                let mut parts: Vec<serde_json::Value> = vec![
-                    serde_json::Value::String("COUNT".into()),
-                    serde_json::Value::String(id.clone()),
-                ];
-                for f in filters {
-                    parts.push(serde_json::to_value(f).unwrap());
-                }
-                serde_json::to_string(&parts).unwrap()
-            }
+            ClientMessage::Count { id, filters } => serialize_id_filters("COUNT", id, filters),
         }
     }
+}
+
+fn serialize_id_filters(verb: &str, id: &str, filters: &[Filter]) -> String {
+    let mut parts: Vec<serde_json::Value> = vec![
+        serde_json::Value::String(verb.into()),
+        serde_json::Value::String(id.into()),
+    ];
+    for f in filters {
+        parts.push(serde_json::to_value(f).unwrap());
+    }
+    serde_json::to_string(&parts).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -298,4 +291,89 @@ pub enum RelayError {
     AuthRequired,
     #[error("URL parse error: {0}")]
     Url(String),
+    #[error("Operation timed out")]
+    Timeout,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: Filter defaults are all None / empty.
+    #[test]
+    fn filter_default() {
+        let f = Filter::default();
+        assert!(f.ids.is_none());
+        assert!(f.authors.is_none());
+        assert!(f.kinds.is_none());
+        assert!(f.since.is_none());
+        assert!(f.until.is_none());
+        assert!(f.limit.is_none());
+    }
+
+    /// Smoke test: ClientMessage serialization produces valid NIP-01 JSON.
+    #[test]
+    fn client_message_req_serialization() {
+        let msg = ClientMessage::Req {
+            id: "test123".into(),
+            filters: vec![Filter {
+                kinds: Some(vec![1]),
+                limit: Some(5),
+                ..Default::default()
+            }],
+        };
+        let json = msg.to_json();
+        assert!(json.starts_with(r#"["REQ","test123","#));
+    }
+
+    #[test]
+    fn relay_message_parse_event() {
+        let json = r#"["EVENT","sub1",{"id":"abc","pubkey":"def","created_at":1000,"kind":1,"tags":[],"content":"hello","sig":"xyz"}]"#;
+        let msg = RelayMessage::from_json(json).unwrap();
+        match msg {
+            RelayMessage::Event { sub_id, event } => {
+                assert_eq!(sub_id, "sub1");
+                assert_eq!(event.content, "hello");
+            }
+            _ => panic!("expected Event"),
+        }
+    }
+
+    #[test]
+    fn relay_message_parse_eose() {
+        let json = r#"["EOSE","sub1"]"#;
+        let msg = RelayMessage::from_json(json).unwrap();
+        match msg {
+            RelayMessage::Eose { sub_id } => assert_eq!(sub_id, "sub1"),
+            _ => panic!("expected Eose"),
+        }
+    }
+
+    #[test]
+    fn relay_message_parse_ok() {
+        let json = r#"["OK","eventid123",true,""]"#;
+        let msg = RelayMessage::from_json(json).unwrap();
+        match msg {
+            RelayMessage::Ok {
+                event_id,
+                ok,
+                message,
+            } => {
+                assert_eq!(event_id, "eventid123");
+                assert!(ok);
+                assert_eq!(message, "");
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn relay_message_parse_notice() {
+        let json = r#"["NOTICE","hello world"]"#;
+        let msg = RelayMessage::from_json(json).unwrap();
+        match msg {
+            RelayMessage::Notice { message } => assert_eq!(message, "hello world"),
+            _ => panic!("expected Notice"),
+        }
+    }
 }

@@ -6,7 +6,7 @@
 //! subscription IDs, event routing). All WebSocket mechanics live in
 //! [`RelaySocket`].
 
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
 use std::time::Duration;
 
 use async_stream::stream;
@@ -20,8 +20,6 @@ use crate::types::{
 };
 
 pub use crate::socket::DEFAULT_KEEP_ALIVE;
-
-use std::pin::Pin;
 
 // ---------------------------------------------------------------------------
 // Relay
@@ -166,52 +164,15 @@ impl Relay {
     /// **Connects automatically** if not already connected.
     pub async fn publish(&self, event: NostrEvent) -> Result<PublishResponse, RelayError> {
         let event_id = event.id.clone();
-        let url = self.socket.url().to_string();
+        self.await_ok_response(ClientMessage::Event(event), event_id).await
+    }
 
-        let (tx, rx) = oneshot::channel::<PublishResponse>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-
-        let mut rx_msg = self.socket.subscribe_raw().await.map_err(RelayError::from)?;
-        let event_id_task = event_id.clone();
-        let url_task = url.clone();
-        let tx_task = Arc::clone(&tx);
-
-        tokio::spawn(async move {
-            loop {
-                match rx_msg.recv().await {
-                    Ok(text) => {
-                        if !text.contains(&event_id_task) { continue; }
-                        if let Ok(RelayMessage::Ok { event_id: eid, ok, message }) =
-                            RelayMessage::from_json(&text)
-                        {
-                            if eid == event_id_task {
-                                if let Some(sender) = tx_task.lock().unwrap().take() {
-                                    let _ = sender.send(PublishResponse {
-                                        from: url_task.clone(),
-                                        event_id: eid,
-                                        ok,
-                                        message,
-                                    });
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    _ => {}
-                }
-            }
-        });
-
-        self.socket
-            .send(ClientMessage::Event(event).to_json())
-            .await
-            .map_err(RelayError::from)?;
-
-        tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .map_err(|_| RelayError::WebSocket("publish timeout".into()))?
-            .map_err(|_| RelayError::ConnectionClosed)
+    /// Send a NIP-42 AUTH response event.
+    ///
+    /// **Connects automatically** if not already connected.
+    pub async fn auth(&self, event: NostrEvent) -> Result<PublishResponse, RelayError> {
+        let event_id = event.id.clone();
+        self.await_ok_response(ClientMessage::Auth(event), event_id).await
     }
 
     /// Send a NIP-45 COUNT request.
@@ -221,36 +182,33 @@ impl Relay {
         let sub_id = nanoid::nanoid!(12);
         let url = self.socket.url().to_string();
 
-        let (tx, rx) = oneshot::channel::<CountResponse>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-
         let mut rx_msg = self.socket.subscribe_raw().await.map_err(RelayError::from)?;
+        let (mut tx, rx) = oneshot::channel::<CountResponse>();
         let sub_id_task = sub_id.clone();
         let url_task = url.clone();
-        let tx_task = Arc::clone(&tx);
 
         tokio::spawn(async move {
             loop {
-                match rx_msg.recv().await {
-                    Ok(text) => {
-                        if !text.contains(&sub_id_task) { continue; }
-                        if let Ok(RelayMessage::Count { sub_id: sid, count }) =
-                            RelayMessage::from_json(&text)
-                        {
-                            if sid == sub_id_task {
-                                if let Some(sender) = tx_task.lock().unwrap().take() {
-                                    let _ = sender.send(CountResponse {
-                                        from: url_task.clone(),
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    msg = rx_msg.recv() => match msg {
+                        Ok(text) => {
+                            if let Ok(RelayMessage::Count { sub_id: sid, count }) =
+                                RelayMessage::from_json(&text)
+                            {
+                                if sid == sub_id_task {
+                                    let _ = tx.send(CountResponse {
+                                        from: url_task,
                                         sub_id: sid,
                                         count,
                                     });
+                                    break;
                                 }
-                                break;
                             }
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        _ => {}
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    _ => {}
                 }
             }
         });
@@ -262,60 +220,7 @@ impl Relay {
 
         tokio::time::timeout(Duration::from_secs(10), rx)
             .await
-            .map_err(|_| RelayError::WebSocket("count timeout".into()))?
-            .map_err(|_| RelayError::ConnectionClosed)
-    }
-
-    /// Send a NIP-42 AUTH response event.
-    ///
-    /// **Connects automatically** if not already connected.
-    pub async fn auth(&self, event: NostrEvent) -> Result<PublishResponse, RelayError> {
-        let event_id = event.id.clone();
-        let url = self.socket.url().to_string();
-
-        let (tx, rx) = oneshot::channel::<PublishResponse>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-
-        let mut rx_msg = self.socket.subscribe_raw().await.map_err(RelayError::from)?;
-        let event_id_task = event_id.clone();
-        let url_task = url.clone();
-        let tx_task = Arc::clone(&tx);
-
-        tokio::spawn(async move {
-            loop {
-                match rx_msg.recv().await {
-                    Ok(text) => {
-                        if !text.contains(&event_id_task) { continue; }
-                        if let Ok(RelayMessage::Ok { event_id: eid, ok, message }) =
-                            RelayMessage::from_json(&text)
-                        {
-                            if eid == event_id_task {
-                                if let Some(sender) = tx_task.lock().unwrap().take() {
-                                    let _ = sender.send(PublishResponse {
-                                        from: url_task.clone(),
-                                        event_id: eid,
-                                        ok,
-                                        message,
-                                    });
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    _ => {}
-                }
-            }
-        });
-
-        self.socket
-            .send(ClientMessage::Auth(event).to_json())
-            .await
-            .map_err(RelayError::from)?;
-
-        tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .map_err(|_| RelayError::WebSocket("auth timeout".into()))?
+            .map_err(|_| RelayError::Timeout)?
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
@@ -375,6 +280,63 @@ impl Relay {
         filters: Vec<Filter>,
     ) -> Pin<Box<dyn Stream<Item = Result<NostrEvent, RelayError>> + Send + 'static>> {
         self.req(filters).events()
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    /// Spawn a listener for `RelayMessage::Ok` keyed on `event_id`, send
+    /// `outbound`, and await the response with a 10-second timeout.
+    ///
+    /// Shared by [`publish`](Relay::publish) and [`auth`](Relay::auth) — the
+    /// only difference between those two methods is which `ClientMessage`
+    /// variant is sent.
+    async fn await_ok_response(
+        &self,
+        outbound: ClientMessage,
+        event_id: String,
+    ) -> Result<PublishResponse, RelayError> {
+        let url = self.socket.url().to_string();
+        let mut rx_msg = self.socket.subscribe_raw().await.map_err(RelayError::from)?;
+        let (mut tx, rx) = oneshot::channel::<PublishResponse>();
+        let event_id_task = event_id.clone();
+        let url_task = url.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Exit early if the caller dropped `rx` (e.g. on send failure).
+                    _ = tx.closed() => break,
+                    msg = rx_msg.recv() => match msg {
+                        Ok(text) => {
+                            if let Ok(RelayMessage::Ok { event_id: eid, ok, message }) =
+                                RelayMessage::from_json(&text)
+                            {
+                                if eid == event_id_task {
+                                    let _ = tx.send(PublishResponse {
+                                        from: url_task,
+                                        event_id: eid,
+                                        ok,
+                                        message,
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        self.socket.send(outbound.to_json()).await.map_err(RelayError::from)?;
+
+        tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| RelayError::Timeout)?
+            .map_err(|_| RelayError::ConnectionClosed)
     }
 }
 
@@ -458,3 +420,95 @@ impl<S> ReqStreamExt for S
 where
     S: Stream<Item = Result<ReqMessage, RelayError>> + Send + 'static,
 {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    /// Smoke test: Relay starts disconnected with zero subscriptions.
+    #[test]
+    fn relay_construction() {
+        let relay = Relay::new("wss://relay.damus.io");
+        assert_eq!(relay.url(), "wss://relay.damus.io");
+        assert!(!relay.is_connected());
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Relay with a custom keepAlive duration.
+    #[test]
+    fn relay_with_keep_alive() {
+        let relay = Relay::with_keep_alive("wss://relay.damus.io", Duration::from_secs(5));
+        assert_eq!(relay.url(), "wss://relay.damus.io");
+        assert!(!relay.is_connected());
+    }
+
+    /// req() is now sync — calling it does NOT connect the socket.
+    #[test]
+    fn req_is_sync_and_does_not_connect() {
+        let relay = Relay::new("wss://relay.damus.io");
+        let _stream = relay.req(vec![crate::types::Filter::default()]);
+        // Socket must still be closed — nothing was polled.
+        assert!(!relay.is_connected());
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Polling req() on a bad URL surfaces the error as the first stream item.
+    #[tokio::test]
+    async fn req_deferred_connect_fails_on_bad_url() {
+        let relay = Relay::new("ws://127.0.0.1:1"); // port 1 — always refused
+        let mut stream = relay.req(vec![crate::types::Filter::default()]);
+        // First poll triggers the connect attempt.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Err(_))),
+            "expected first item to be Err, got {first:?}"
+        );
+        // Sub count must not have been incremented on connect failure.
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Dropping the stream sends CLOSE and decrements the sub count synchronously.
+    /// After keepAlive the socket closes.
+    #[tokio::test]
+    async fn keep_alive_disconnects_after_last_sub() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = tokio_tungstenite::accept_async(stream).await;
+                });
+            }
+        });
+
+        let relay = Relay::with_keep_alive(
+            format!("ws://{addr}"),
+            Duration::from_millis(100),
+        );
+
+        let mut stream = relay.req(vec![crate::types::Filter::default()]);
+
+        // First poll connects and emits Open — the socket is now live.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Ok(ReqMessage::Open { .. }))),
+            "expected Open, got {first:?}"
+        );
+        assert!(relay.is_connected());
+        assert_eq!(relay.subscription_count(), 1);
+
+        // Drop the stream — RAII guard fires: CLOSE sent, sub_count → 0.
+        drop(stream);
+
+        assert_eq!(relay.subscription_count(), 0);
+
+        // Wait for keepAlive to close the socket.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!relay.is_connected());
+    }
+}

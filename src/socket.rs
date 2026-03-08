@@ -16,7 +16,7 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_stream::stream;
@@ -84,7 +84,10 @@ struct DropGuard {
     cmd_tx: mpsc::UnboundedSender<Command>,
     unsubscribe_msg: String,
     sub_count: Arc<AtomicUsize>,
-    socket: RelaySocket,
+    // Fields needed to schedule keep-alive directly, without holding a full RelaySocket.
+    handle: Arc<Mutex<Option<ConnectionHandle>>>,
+    keep_alive_gen: Arc<AtomicU64>,
+    keep_alive: Duration,
 }
 
 impl Drop for DropGuard {
@@ -92,7 +95,27 @@ impl Drop for DropGuard {
         let _ = self.cmd_tx.send(Command::Send(self.unsubscribe_msg.clone()));
         let prev = self.sub_count.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
-            self.socket.schedule_keep_alive();
+            // Last channel dropped — start the keep-alive timer.
+            let ka_gen = self.keep_alive_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            let handle = Arc::clone(&self.handle);
+            let sub_count = Arc::clone(&self.sub_count);
+            let keep_alive_gen = Arc::clone(&self.keep_alive_gen);
+            let keep_alive = self.keep_alive;
+
+            tokio::spawn(async move {
+                tokio::time::sleep(keep_alive).await;
+                // Abort if a newer keep-alive timer superseded us, or if new
+                // subscriptions have opened since we were scheduled.
+                if keep_alive_gen.load(Ordering::SeqCst) == ka_gen
+                    && sub_count.load(Ordering::SeqCst) == 0
+                {
+                    let mut guard = handle.lock().unwrap();
+                    if let Some(h) = guard.as_ref() {
+                        let _ = h.cmd_tx.send(Command::Disconnect);
+                    }
+                    *guard = None;
+                }
+            });
         }
     }
 }
@@ -113,6 +136,10 @@ pub struct RelaySocket {
     handle: Arc<Mutex<Option<ConnectionHandle>>>,
     sub_count: Arc<AtomicUsize>,
     keep_alive: Duration,
+    keep_alive_gen: Arc<AtomicU64>,
+    /// Serializes concurrent slow-path connection attempts to prevent opening
+    /// multiple WebSocket connections simultaneously (TOCTOU guard).
+    connecting: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RelaySocket {
@@ -129,6 +156,8 @@ impl RelaySocket {
             handle: Arc::new(Mutex::new(None)),
             sub_count: Arc::new(AtomicUsize::new(0)),
             keep_alive,
+            keep_alive_gen: Arc::new(AtomicU64::new(0)),
+            connecting: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -139,7 +168,7 @@ impl RelaySocket {
     /// Ensure the WebSocket is open, connecting if necessary.
     /// Safe to call concurrently — only one connection is ever opened.
     pub(crate) async fn ensure_connected(&self) -> Result<ConnectionHandle, SocketError> {
-        // Fast path.
+        // Fast path — no locking on the happy path.
         {
             let guard = self.handle.lock().unwrap();
             if let Some(h) = guard.as_ref() {
@@ -147,7 +176,18 @@ impl RelaySocket {
             }
         }
 
-        // Slow path — open the socket.
+        // Slow path — acquire the connecting mutex so only one task opens a
+        // WebSocket even when many callers race concurrently.
+        let _conn_guard = self.connecting.lock().await;
+
+        // Double-check: another task may have connected while we waited.
+        {
+            let guard = self.handle.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                return Ok(h.clone());
+            }
+        }
+
         let (ws_stream, _) = connect_async(&self.url)
             .await
             .map_err(|e| SocketError::Connect(e.to_string()))?;
@@ -191,14 +231,10 @@ impl RelaySocket {
         });
 
         let handle = ConnectionHandle { cmd_tx, msg_tx };
-
-        // Double-check: another task may have connected while we awaited.
         let mut guard = self.handle.lock().unwrap();
-        if let Some(existing) = guard.as_ref() {
-            return Ok(existing.clone());
-        }
         *guard = Some(handle.clone());
         Ok(handle)
+        // _conn_guard drops here, unblocking the next waiter
     }
 
     /// Explicitly open the socket (optional — operations connect automatically).
@@ -213,25 +249,8 @@ impl RelaySocket {
             let _ = h.cmd_tx.send(Command::Disconnect);
         }
         *guard = None;
-        self.sub_count.store(0, Ordering::SeqCst);
-    }
-
-    /// Schedule a keepAlive check. Called when a channel's ref-count hits 0.
-    pub(crate) fn schedule_keep_alive(&self) {
-        let handle_arc = Arc::clone(&self.handle);
-        let sub_count = Arc::clone(&self.sub_count);
-        let keep_alive = self.keep_alive;
-
-        tokio::spawn(async move {
-            tokio::time::sleep(keep_alive).await;
-            if sub_count.load(Ordering::SeqCst) == 0 {
-                let mut guard = handle_arc.lock().unwrap();
-                if let Some(h) = guard.as_ref() {
-                    let _ = h.cmd_tx.send(Command::Disconnect);
-                }
-                *guard = None;
-            }
-        });
+        // sub_count is NOT reset here — active DropGuards will decrement it
+        // naturally. Resetting it here races with concurrent multiplex() calls.
     }
 
     // -----------------------------------------------------------------------
@@ -344,7 +363,9 @@ impl RelaySocket {
             cmd_tx: handle.cmd_tx.clone(),
             unsubscribe_msg,
             sub_count: Arc::clone(&self.sub_count),
-            socket: self.clone(),
+            handle: Arc::clone(&self.handle),
+            keep_alive_gen: Arc::clone(&self.keep_alive_gen),
+            keep_alive: self.keep_alive,
         };
 
         let inbound = Box::pin(stream! {
