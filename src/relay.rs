@@ -458,3 +458,95 @@ impl<S> ReqStreamExt for S
 where
     S: Stream<Item = Result<ReqMessage, RelayError>> + Send + 'static,
 {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    /// Smoke test: Relay starts disconnected with zero subscriptions.
+    #[test]
+    fn relay_construction() {
+        let relay = Relay::new("wss://relay.damus.io");
+        assert_eq!(relay.url(), "wss://relay.damus.io");
+        assert!(!relay.is_connected());
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Relay with a custom keepAlive duration.
+    #[test]
+    fn relay_with_keep_alive() {
+        let relay = Relay::with_keep_alive("wss://relay.damus.io", Duration::from_secs(5));
+        assert_eq!(relay.url(), "wss://relay.damus.io");
+        assert!(!relay.is_connected());
+    }
+
+    /// req() is now sync — calling it does NOT connect the socket.
+    #[test]
+    fn req_is_sync_and_does_not_connect() {
+        let relay = Relay::new("wss://relay.damus.io");
+        let _stream = relay.req(vec![crate::types::Filter::default()]);
+        // Socket must still be closed — nothing was polled.
+        assert!(!relay.is_connected());
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Polling req() on a bad URL surfaces the error as the first stream item.
+    #[tokio::test]
+    async fn req_deferred_connect_fails_on_bad_url() {
+        let relay = Relay::new("ws://127.0.0.1:1"); // port 1 — always refused
+        let mut stream = relay.req(vec![crate::types::Filter::default()]);
+        // First poll triggers the connect attempt.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Err(_))),
+            "expected first item to be Err, got {first:?}"
+        );
+        // Sub count must not have been incremented on connect failure.
+        assert_eq!(relay.subscription_count(), 0);
+    }
+
+    /// Dropping the stream sends CLOSE and decrements the sub count synchronously.
+    /// After keepAlive the socket closes.
+    #[tokio::test]
+    async fn keep_alive_disconnects_after_last_sub() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = tokio_tungstenite::accept_async(stream).await;
+                });
+            }
+        });
+
+        let relay = Relay::with_keep_alive(
+            format!("ws://{addr}"),
+            Duration::from_millis(100),
+        );
+
+        let mut stream = relay.req(vec![crate::types::Filter::default()]);
+
+        // First poll connects and emits Open — the socket is now live.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Ok(ReqMessage::Open { .. }))),
+            "expected Open, got {first:?}"
+        );
+        assert!(relay.is_connected());
+        assert_eq!(relay.subscription_count(), 1);
+
+        // Drop the stream — RAII guard fires: CLOSE sent, sub_count → 0.
+        drop(stream);
+
+        assert_eq!(relay.subscription_count(), 0);
+
+        // Wait for keepAlive to close the socket.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!relay.is_connected());
+    }
+}
